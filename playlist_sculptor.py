@@ -12,11 +12,9 @@ This unified app combines features from both the original playlist_sculptor.py a
 - Discriminator for personalized song recommendations
 - Similarity matrix and latent space visualization
 - Audio preview playback
-- Persistent song metadata storage
+- SQLite database for persistent storage with playlist support
 """
 
-import dataclasses
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,36 +29,20 @@ import streamlit as st
 import yt_dlp
 from jax import random
 
+from src.playlist_sculptor import db
+
 # =========================
 # Paths & Constants
 # =========================
 
 DATA_DIR = Path("data")
 AUDIO_DIR = DATA_DIR / "audio"
-FEATURES_PATH = DATA_DIR / "features.npy"
-SONGS_META_PATH = DATA_DIR / "songs_meta.json"
-AE_MODEL_PATH = DATA_DIR / "feature_ae.npz"
-DISC_MODEL_PATH = DATA_DIR / "discriminator.npz"
 
 LATENT_DIM = 11
 HIDDEN_DIM = 64
 BATCH_SIZE = 32
 SAMPLE_RATE = 22050
 MIN_STD_THRESHOLD = 1e-6  # Minimum threshold for standard deviation normalization
-
-
-# =========================
-# Dataclasses
-# =========================
-
-@dataclass
-class SongMeta:
-    """Metadata for a song."""
-    id: int
-    youtube_url: str
-    audio_path: Optional[str] = None
-    accepted: bool = False
-    rejected: bool = False
 
 
 @dataclass
@@ -93,34 +75,27 @@ def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def save_songs_meta(songs: List[SongMeta]):
-    """Save song metadata to JSON file."""
-    ensure_dirs()
-    with open(SONGS_META_PATH, "w") as f:
-        json.dump([dataclasses.asdict(s) for s in songs], f, indent=2)
+def load_song_list_from_txt(txt_path: str) -> List[int]:
+    """Load YouTube URLs from a text file and add to database.
 
-
-def load_songs_meta() -> Optional[List[SongMeta]]:
-    """Load song metadata from JSON file."""
-    if not SONGS_META_PATH.exists():
-        return None
-    with open(SONGS_META_PATH, "r") as f:
-        raw = json.load(f)
-    return [SongMeta(**item) for item in raw]
-
-
-def load_song_list_from_txt(txt_path: str) -> List[SongMeta]:
-    """Load YouTube URLs from a text file."""
+    Returns list of song IDs.
+    """
     with open(txt_path, "r") as f:
         urls = [line.strip() for line in f if line.strip()]
-    return [SongMeta(id=i, youtube_url=url) for i, url in enumerate(urls)]
+
+    song_ids = []
+    for url in urls:
+        song_id = db.add_song(url)
+        song_ids.append(song_id)
+
+    return song_ids
 
 
 # =========================
 # Audio Download
 # =========================
 
-def download_audio_for_song(song: SongMeta) -> SongMeta:
+def download_audio_for_song(song: db.Song) -> db.Song:
     """Download audio for a song using yt-dlp."""
     if song.audio_path and os.path.exists(song.audio_path):
         return song
@@ -143,6 +118,7 @@ def download_audio_for_song(song: SongMeta) -> SongMeta:
         vid_id = info.get("id")
         ext = info.get("ext", "m4a")
         audio_path = str(AUDIO_DIR / f"{vid_id}.{ext}")
+        db.update_song_audio_path(song.id, audio_path)
         song.audio_path = audio_path
         return song
 
@@ -227,29 +203,41 @@ def extract_features_from_audio(audio_path: str, sr: int = SAMPLE_RATE) -> np.nd
     return feats
 
 
-def build_or_load_feature_matrix(songs: List[SongMeta]) -> np.ndarray:
-    """Build or load the feature matrix for all songs."""
-    ensure_dirs()
-    if FEATURES_PATH.exists():
-        feats = np.load(FEATURES_PATH)
-        if feats.shape[0] == len(songs):
-            return feats
+def extract_and_store_features_for_song(song: db.Song) -> Optional[np.ndarray]:
+    """Extract and store features for a song in the database."""
+    if song.features is not None:
+        return song.features
 
+    if not song.audio_path or not os.path.exists(song.audio_path):
+        return None
+
+    try:
+        features = extract_features_from_audio(song.audio_path)
+        db.update_song_features(song.id, features)
+        return features
+    except Exception:
+        return None
+
+
+def build_feature_matrix_for_songs(songs: List[db.Song]) -> np.ndarray:
+    """Build feature matrix for a list of songs, extracting if needed."""
     all_feats = []
-    for i, song in enumerate(songs):
-        if not song.audio_path or not os.path.exists(song.audio_path):
-            songs[i] = download_audio_for_song(song)
-            song = songs[i]
-        if not song.audio_path or not os.path.exists(song.audio_path):
+    for song in songs:
+        if song.features is not None:
+            all_feats.append(song.features)
+        elif song.audio_path and os.path.exists(song.audio_path):
+            features = extract_and_store_features_for_song(song)
+            if features is not None:
+                all_feats.append(features)
+            else:
+                all_feats.append(np.zeros(51, dtype=np.float32))
+        else:
             all_feats.append(np.zeros(51, dtype=np.float32))
-            continue
-        f = extract_features_from_audio(song.audio_path)
-        all_feats.append(f)
 
-    feats = np.stack(all_feats, axis=0)
-    np.save(FEATURES_PATH, feats)
-    save_songs_meta(songs)
-    return feats
+    if not all_feats:
+        return np.array([])
+
+    return np.stack(all_feats, axis=0)
 
 
 # =========================
@@ -328,32 +316,31 @@ def train_feature_ae(params: FeatureAEParams, features: np.ndarray,
     return params
 
 
-def save_feature_ae(params: FeatureAEParams, path: Path):
-    """Save autoencoder parameters."""
-    ensure_dirs()
-    np.savez(
-        path,
-        W_enc=np.array(params.W_enc),
-        b_enc=np.array(params.b_enc),
-        W_dec=np.array(params.W_dec),
-        b_dec=np.array(params.b_dec),
-        mean=np.array(params.mean),
-        std=np.array(params.std),
-    )
+def save_feature_ae_to_db(params: FeatureAEParams):
+    """Save autoencoder parameters to database."""
+    params_dict = {
+        "W_enc": np.array(params.W_enc),
+        "b_enc": np.array(params.b_enc),
+        "W_dec": np.array(params.W_dec),
+        "b_dec": np.array(params.b_dec),
+        "mean": np.array(params.mean),
+        "std": np.array(params.std),
+    }
+    db.save_embedding_model(params_dict)
 
 
-def load_feature_ae(path: Path) -> Optional[FeatureAEParams]:
-    """Load autoencoder parameters."""
-    if not path.exists():
+def load_feature_ae_from_db() -> Optional[FeatureAEParams]:
+    """Load autoencoder parameters from database."""
+    params_dict = db.load_embedding_model()
+    if params_dict is None:
         return None
-    data = np.load(path)
     return FeatureAEParams(
-        W_enc=jnp.array(data["W_enc"]),
-        b_enc=jnp.array(data["b_enc"]),
-        W_dec=jnp.array(data["W_dec"]),
-        b_dec=jnp.array(data["b_dec"]),
-        mean=jnp.array(data["mean"]),
-        std=jnp.array(data["std"]),
+        W_enc=jnp.array(params_dict["W_enc"]),
+        b_enc=jnp.array(params_dict["b_enc"]),
+        W_dec=jnp.array(params_dict["W_dec"]),
+        b_dec=jnp.array(params_dict["b_dec"]),
+        mean=jnp.array(params_dict["mean"]),
+        std=jnp.array(params_dict["std"]),
     )
 
 
@@ -452,28 +439,27 @@ def train_discriminator(params: DiscriminatorParams,
     return params
 
 
-def save_discriminator(params: DiscriminatorParams, path: Path):
-    """Save discriminator parameters."""
-    ensure_dirs()
-    np.savez(
-        path,
-        W1=np.array(params.W1),
-        b1=np.array(params.b1),
-        W2=np.array(params.W2),
-        b2=np.array(params.b2),
-    )
+def save_discriminator_to_db(playlist_id: int, params: DiscriminatorParams):
+    """Save discriminator parameters to database for a playlist."""
+    params_dict = {
+        "W1": np.array(params.W1),
+        "b1": np.array(params.b1),
+        "W2": np.array(params.W2),
+        "b2": np.array(params.b2),
+    }
+    db.save_playlist_discriminator(playlist_id, params_dict)
 
 
-def load_discriminator(path: Path, input_dim: int, hidden_dim: int) -> Optional[DiscriminatorParams]:
-    """Load discriminator parameters."""
-    if not path.exists():
+def load_discriminator_from_db(playlist_id: int) -> Optional[DiscriminatorParams]:
+    """Load discriminator parameters from database for a playlist."""
+    params_dict = db.load_playlist_discriminator(playlist_id)
+    if params_dict is None:
         return None
-    data = np.load(path)
     return DiscriminatorParams(
-        W1=jnp.array(data["W1"]),
-        b1=jnp.array(data["b1"]),
-        W2=jnp.array(data["W2"]),
-        b2=jnp.array(data["b2"]),
+        W1=jnp.array(params_dict["W1"]),
+        b1=jnp.array(params_dict["b1"]),
+        W2=jnp.array(params_dict["W2"]),
+        b2=jnp.array(params_dict["b2"]),
     )
 
 
@@ -540,6 +526,7 @@ def main():
     )
 
     ensure_dirs()
+    db.init_database()
 
     st.title("🎵 Playlist Sculptor")
     st.markdown(
@@ -550,26 +537,35 @@ def main():
         - **yt-dlp** to download audio from YouTube
         - **librosa** to extract audio features
         - **JAX** to train an 11D autoencoder + discriminator for song recommendations
+        - **SQLite** database for persistent storage with multi-playlist support
         """
     )
 
-    # Initialize session state from persistent storage
-    if "songs" not in st.session_state:
-        songs_meta = load_songs_meta()
-        if songs_meta is not None:
-            st.session_state["songs"] = songs_meta
-        else:
-            st.session_state["songs"] = []
+    # Initialize playlist selection in session state
+    if "current_playlist_id" not in st.session_state:
+        st.session_state["current_playlist_id"] = None
 
     # Sidebar navigation
     st.sidebar.title("Navigation")
+
+    # Playlist selector in sidebar
+    render_playlist_selector()
+
+    # Refresh cache button
+    if st.sidebar.button("🔄 Refresh Cache"):
+        db.clear_all_caches()
+        st.rerun()
+
     page = st.sidebar.radio(
         "Select a page",
-        ["Load Songs", "Extract Features", "Train Models", "Sculpt Playlist", "Visualizations", "About"],
+        ["Manage Playlists", "Song Library", "Extract Features", "Train Models",
+         "Sculpt Playlist", "Visualizations", "About"],
     )
 
-    if page == "Load Songs":
-        render_load_songs_page()
+    if page == "Manage Playlists":
+        render_manage_playlists_page()
+    elif page == "Song Library":
+        render_song_library_page()
     elif page == "Extract Features":
         render_extract_features_page()
     elif page == "Train Models":
@@ -582,39 +578,123 @@ def main():
         render_about_page()
 
 
-def render_load_songs_page():
-    """Render the Load Songs page."""
-    st.header("📥 Load Songs")
+def render_playlist_selector():
+    """Render playlist selector in sidebar."""
+    st.sidebar.subheader("🎵 Current Playlist")
 
-    songs: List[SongMeta] = st.session_state["songs"]
+    playlists = db.get_all_playlists()
 
-    # Option 1: Add individual URL
+    if not playlists:
+        st.sidebar.info("No playlists yet. Create one first.")
+        return
+
+    playlist_options = {p.name: p.id for p in playlists}
+    playlist_names = list(playlist_options.keys())
+
+    # Find current selection
+    current_idx = 0
+    if st.session_state["current_playlist_id"]:
+        for i, p in enumerate(playlists):
+            if p.id == st.session_state["current_playlist_id"]:
+                current_idx = i
+                break
+
+    selected_name = st.sidebar.selectbox(
+        "Select playlist",
+        playlist_names,
+        index=current_idx,
+        key="playlist_selector",
+    )
+
+    if selected_name:
+        st.session_state["current_playlist_id"] = playlist_options[selected_name]
+
+
+def render_manage_playlists_page():
+    """Render the Manage Playlists page."""
+    st.header("📋 Manage Playlists")
+
+    # Create new playlist
+    st.subheader("Create New Playlist")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        new_name = st.text_input("Playlist name", placeholder="My Awesome Playlist")
+    with col2:
+        new_desc = st.text_input("Description (optional)", placeholder="A mix of...")
+
+    if st.button("Create Playlist", type="primary"):
+        if new_name:
+            playlist_id = db.create_playlist(new_name, new_desc if new_desc else None)
+            db.clear_playlists_cache()
+            st.success(f"Created playlist '{new_name}' (ID: {playlist_id})")
+            st.session_state["current_playlist_id"] = playlist_id
+            st.rerun()
+        else:
+            st.warning("Please enter a playlist name")
+
+    st.divider()
+
+    # List existing playlists
+    st.subheader("Existing Playlists")
+    playlists = db.get_all_playlists()
+
+    if not playlists:
+        st.info("No playlists yet. Create one above!")
+        return
+
+    for playlist in playlists:
+        songs_in_playlist = db.get_songs_in_playlist(playlist.id)
+        num_songs = len(songs_in_playlist)
+        num_accepted = sum(1 for _, ps in songs_in_playlist if ps.accepted)
+        num_rejected = sum(1 for _, ps in songs_in_playlist if ps.rejected)
+
+        with st.expander(f"📁 {playlist.name} ({num_songs} songs)"):
+            st.write(f"**Description:** {playlist.description or 'No description'}")
+            st.write(f"**Songs:** {num_songs} total, {num_accepted} accepted, {num_rejected} rejected")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Select", key=f"select_{playlist.id}"):
+                    st.session_state["current_playlist_id"] = playlist.id
+                    st.rerun()
+            with col2:
+                if st.button("Delete", key=f"delete_{playlist.id}", type="secondary"):
+                    db.delete_playlist(playlist.id)
+                    db.clear_playlists_cache()
+                    db.clear_playlist_songs_cache()
+                    if st.session_state["current_playlist_id"] == playlist.id:
+                        st.session_state["current_playlist_id"] = None
+                    st.rerun()
+
+
+def render_song_library_page():
+    """Render the Song Library page (global songs)."""
+    st.header("📚 Song Library")
+
+    # Add individual URL
     st.subheader("Add Individual Song")
     url = st.text_input(
         "YouTube URL",
         placeholder="https://www.youtube.com/watch?v=...",
-        help="Enter a YouTube video URL to add to your collection",
+        help="Enter a YouTube video URL to add to your library",
     )
 
     if st.button("Add Song", type="primary"):
         if url:
-            # Check for duplicates
-            existing_urls = [s.youtube_url for s in songs]
-            if url in existing_urls:
-                st.warning("This URL is already in your collection!")
+            existing = db.get_song_by_url(url)
+            if existing:
+                st.warning("This URL is already in your library!")
             else:
-                new_id = len(songs)
-                new_song = SongMeta(id=new_id, youtube_url=url)
-                songs.append(new_song)
-                save_songs_meta(songs)
-                st.success(f"Added song {new_id}!")
+                song_id = db.add_song(url)
+                db.clear_songs_cache()
+                st.success(f"Added song (ID: {song_id})!")
                 st.rerun()
         else:
             st.warning("Please enter a YouTube URL")
 
     st.divider()
 
-    # Option 2: Load from text file
+    # Load from text file
     st.subheader("Load from Text File")
     txt_path = st.text_input(
         "Path to text file with YouTube URLs",
@@ -624,10 +704,9 @@ def render_load_songs_page():
 
     if st.button("Load from File"):
         try:
-            new_songs = load_song_list_from_txt(txt_path)
-            st.session_state["songs"] = new_songs
-            save_songs_meta(new_songs)
-            st.success(f"Loaded {len(new_songs)} songs from {txt_path}")
+            song_ids = load_song_list_from_txt(txt_path)
+            db.clear_songs_cache()
+            st.success(f"Loaded {len(song_ids)} songs from {txt_path}")
             st.rerun()
         except FileNotFoundError:
             st.error(f"File not found: {txt_path}")
@@ -636,67 +715,75 @@ def render_load_songs_page():
 
     st.divider()
 
-    # Display current songs
-    st.subheader(f"📚 Song Collection ({len(songs)} songs)")
+    # Display all songs
+    songs = db.get_all_songs()
+    st.subheader(f"📚 All Songs ({len(songs)} total)")
 
-    if songs:
-        # Three column view
-        col1, col2, col3 = st.columns(3)
+    if not songs:
+        st.info("No songs in library. Add URLs above or load from a text file.")
+        return
 
+    # Option to add songs to current playlist
+    current_playlist_id = st.session_state.get("current_playlist_id")
+
+    for song in songs:
+        col1, col2, col3 = st.columns([3, 1, 1])
         with col1:
-            st.markdown("**✅ Accepted**")
-            for s in songs:
-                if s.accepted:
-                    st.write(f"{s.id}: {s.youtube_url[:40]}...")
-
+            status = "✅ Has audio" if song.audio_path and os.path.exists(song.audio_path) else "⏳ No audio"
+            features_status = "📊 Has features" if song.features is not None else ""
+            st.write(f"**{song.id}**: {song.youtube_url[:50]}... {status} {features_status}")
         with col2:
-            st.markdown("**❌ Rejected**")
-            for s in songs:
-                if s.rejected:
-                    st.write(f"{s.id}: {s.youtube_url[:40]}...")
-
+            if current_playlist_id:
+                ps = db.get_playlist_song_status(current_playlist_id, song.id)
+                if ps is None:
+                    if st.button("Add to playlist", key=f"add_to_pl_{song.id}"):
+                        db.add_song_to_playlist(current_playlist_id, song.id)
+                        db.clear_playlist_songs_cache()
+                        st.rerun()
+                else:
+                    st.write("✓ In playlist")
         with col3:
-            st.markdown("**⚪ Neutral**")
-            for s in songs:
-                if not s.accepted and not s.rejected:
-                    st.write(f"{s.id}: {s.youtube_url[:40]}...")
-    else:
-        st.info("No songs loaded. Add URLs above or load from a text file.")
+            if st.button("🗑️", key=f"delete_song_{song.id}"):
+                db.delete_song(song.id)
+                db.clear_songs_cache()
+                db.clear_playlist_songs_cache()
+                st.rerun()
 
 
 def render_extract_features_page():
     """Render the Extract Features page."""
     st.header("🎧 Extract Features")
 
-    songs: List[SongMeta] = st.session_state.get("songs", [])
+    songs = db.get_all_songs()
 
     if not songs:
-        st.warning("No songs loaded. Go to 'Load Songs' page first.")
+        st.warning("No songs in library. Go to 'Song Library' page first.")
         return
 
     st.write(f"Total songs: {len(songs)}")
 
     # Show download/extract status
     downloaded = sum(1 for s in songs if s.audio_path and os.path.exists(s.audio_path))
+    with_features = sum(1 for s in songs if s.features is not None)
     st.write(f"Downloaded: {downloaded}/{len(songs)}")
-
-    if FEATURES_PATH.exists():
-        features = np.load(FEATURES_PATH)
-        st.success(f"Feature matrix exists: {features.shape}")
-    else:
-        st.info("No feature matrix yet.")
+    st.write(f"With features: {with_features}/{len(songs)}")
 
     if st.button("Download Audio & Extract Features", type="primary"):
         with st.spinner("Processing songs..."):
             progress_bar = st.progress(0)
             for i, song in enumerate(songs):
                 progress_bar.progress((i + 1) / len(songs))
-                if not song.audio_path or not os.path.exists(song.audio_path):
-                    songs[i] = download_audio_for_song(song)
 
-            feats = build_or_load_feature_matrix(songs)
-            st.session_state["songs"] = songs
-            st.success(f"Feature matrix shape: {feats.shape}")
+                # Download if needed
+                if not song.audio_path or not os.path.exists(song.audio_path):
+                    song = download_audio_for_song(song)
+
+                # Extract features if needed
+                if song.features is None and song.audio_path and os.path.exists(song.audio_path):
+                    extract_and_store_features_for_song(song)
+
+            db.clear_songs_cache()
+            st.success("Processing complete!")
             st.rerun()
 
 
@@ -704,26 +791,23 @@ def render_train_models_page():
     """Render the Train Models page."""
     st.header("🧠 Train Models")
 
-    songs: List[SongMeta] = st.session_state.get("songs", [])
+    # Get all songs with features for training embedding model
+    features, song_ids = db.get_all_songs_feature_matrix()
 
-    if not songs:
-        st.warning("No songs loaded. Go to 'Load Songs' page first.")
+    if len(features) == 0:
+        st.warning("No songs with features. Go to 'Extract Features' page first.")
         return
 
-    if not FEATURES_PATH.exists():
-        st.warning("No features extracted. Go to 'Extract Features' page first.")
-        return
-
-    features = np.load(FEATURES_PATH)
     num_songs, feat_dim = features.shape
-    st.write(f"Songs: {num_songs}, Feature dimension: {feat_dim}")
+    st.write(f"Songs with features: {num_songs}, Feature dimension: {feat_dim}")
 
-    # Feature Autoencoder Section
-    st.subheader("Feature Autoencoder")
+    # Feature Autoencoder Section (trained on ALL songs)
+    st.subheader("Feature Autoencoder (Shared Embedding Model)")
+    st.info("The embedding model is trained on ALL songs in the library, not just songs in the current playlist.")
 
-    ae_params = load_feature_ae(AE_MODEL_PATH)
+    ae_params = load_feature_ae_from_db()
     if ae_params is not None:
-        st.success("✅ Feature AE model loaded")
+        st.success("✅ Feature AE model loaded from database")
     else:
         st.info("No feature AE model found. Train one below.")
 
@@ -733,8 +817,8 @@ def render_train_models_page():
     with col2:
         ae_lr = st.number_input("AE Learning Rate", min_value=1e-5, max_value=1e-1, value=1e-3, format="%.5f")
 
-    if st.button("Train Feature AE"):
-        with st.spinner("Training Feature AE..."):
+    if st.button("Train Feature AE on All Songs"):
+        with st.spinner("Training Feature AE on all songs..."):
             mean, std = compute_feature_stats(features)
             rng = random.PRNGKey(0)
             if ae_params is None or ae_params.W_enc.shape[1] != feat_dim:
@@ -749,35 +833,54 @@ def render_train_models_page():
                     std=jnp.array(std),
                 )
             ae_params = train_feature_ae(ae_params, features, num_epochs=ae_epochs, lr=ae_lr)
-            save_feature_ae(ae_params, AE_MODEL_PATH)
-            st.success("Feature AE trained and saved!")
+            save_feature_ae_to_db(ae_params)
+            st.success("Feature AE trained and saved to database!")
             st.rerun()
 
     st.divider()
 
-    # Discriminator Section
-    st.subheader("Discriminator (for recommendations)")
+    # Discriminator Section (per playlist)
+    st.subheader("Discriminator (Per-Playlist Recommendations)")
 
-    ae_params = load_feature_ae(AE_MODEL_PATH)
+    current_playlist_id = st.session_state.get("current_playlist_id")
+    if not current_playlist_id:
+        st.warning("Select a playlist first to train its discriminator.")
+        return
+
+    playlist = db.get_playlist(current_playlist_id)
+    if not playlist:
+        st.error("Selected playlist not found.")
+        return
+
+    st.write(f"Training discriminator for: **{playlist.name}**")
+
+    ae_params = load_feature_ae_from_db()
     if ae_params is None:
         st.warning("Train the Feature AE first before training the discriminator.")
         return
 
-    track_embs = compute_track_embeddings(ae_params, features)
-    accepted_mask = np.array([s.accepted for s in songs], dtype=bool)
-    rejected_mask = np.array([s.rejected for s in songs], dtype=bool)
+    # Get songs in the current playlist with their features
+    playlist_features, playlist_song_ids, accepted_flags, rejected_flags = db.get_playlist_feature_matrix(current_playlist_id)
 
-    st.write(f"Accepted songs: {sum(accepted_mask)}")
-    st.write(f"Rejected songs: {sum(rejected_mask)}")
+    if len(playlist_features) == 0:
+        st.warning("No songs with features in this playlist. Add songs and extract features first.")
+        return
+
+    track_embs = compute_track_embeddings(ae_params, playlist_features)
+    accepted_mask = np.array(accepted_flags, dtype=bool)
+    rejected_mask = np.array(rejected_flags, dtype=bool)
+
+    st.write(f"Songs in playlist: {len(playlist_song_ids)}")
+    st.write(f"Accepted: {sum(accepted_mask)}, Rejected: {sum(rejected_mask)}")
 
     playlist_vec = compute_playlist_embedding(track_embs, accepted_mask)
     input_dim_disc = (LATENT_DIM + (LATENT_DIM * (LATENT_DIM + 1)) // 2) + LATENT_DIM
 
-    disc_params = load_discriminator(DISC_MODEL_PATH, input_dim_disc, HIDDEN_DIM)
+    disc_params = load_discriminator_from_db(current_playlist_id)
     if disc_params is not None:
-        st.success("✅ Discriminator model loaded")
+        st.success("✅ Discriminator model loaded for this playlist")
     else:
-        st.info("No discriminator model found. Train one below.")
+        st.info("No discriminator model found for this playlist. Train one below.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -799,8 +902,8 @@ def render_train_models_page():
                     disc_params = init_discriminator(rng, input_dim_disc, HIDDEN_DIM)
                 disc_params = train_discriminator(disc_params, playlist_vec, X_embs, y_labels,
                                                   num_epochs=disc_epochs, lr=disc_lr)
-                save_discriminator(disc_params, DISC_MODEL_PATH)
-                st.success("Discriminator trained and saved!")
+                save_discriminator_to_db(current_playlist_id, disc_params)
+                st.success("Discriminator trained and saved for this playlist!")
                 st.rerun()
 
 
@@ -808,56 +911,72 @@ def render_sculpt_playlist_page():
     """Render the Sculpt Playlist page with accept/reject workflow."""
     st.header("🎨 Sculpt Playlist")
 
-    songs: List[SongMeta] = st.session_state.get("songs", [])
-
-    if not songs:
-        st.warning("No songs loaded. Go to 'Load Songs' page first.")
+    current_playlist_id = st.session_state.get("current_playlist_id")
+    if not current_playlist_id:
+        st.warning("Select a playlist first from the sidebar.")
         return
 
-    if not FEATURES_PATH.exists():
-        st.warning("No features extracted. Go to 'Extract Features' page first.")
+    playlist = db.get_playlist(current_playlist_id)
+    if not playlist:
+        st.error("Selected playlist not found.")
         return
 
-    ae_params = load_feature_ae(AE_MODEL_PATH)
+    st.write(f"Working on: **{playlist.name}**")
+
+    # Get songs in the current playlist
+    playlist_songs = db.get_songs_in_playlist(current_playlist_id)
+
+    if not playlist_songs:
+        st.warning("No songs in this playlist. Add songs from the 'Song Library' page.")
+        return
+
+    # Get feature matrix
+    playlist_features, playlist_song_ids, accepted_flags, rejected_flags = db.get_playlist_feature_matrix(current_playlist_id)
+
+    if len(playlist_features) == 0:
+        st.warning("No songs with features in this playlist. Extract features first.")
+        return
+
+    ae_params = load_feature_ae_from_db()
     if ae_params is None:
         st.warning("Train the Feature AE first on 'Train Models' page.")
         return
 
-    features = np.load(FEATURES_PATH)
-    track_embs = compute_track_embeddings(ae_params, features)
-
-    accepted_mask = np.array([s.accepted for s in songs], dtype=bool)
+    track_embs = compute_track_embeddings(ae_params, playlist_features)
+    accepted_mask = np.array(accepted_flags, dtype=bool)
     playlist_vec = compute_playlist_embedding(track_embs, accepted_mask)
 
-    input_dim_disc = (LATENT_DIM + (LATENT_DIM * (LATENT_DIM + 1)) // 2) + LATENT_DIM
-    disc_params = load_discriminator(DISC_MODEL_PATH, input_dim_disc, HIDDEN_DIM)
+    disc_params = load_discriminator_from_db(current_playlist_id)
 
     # Song Suggestions
     st.subheader("🎯 Song Suggestions")
 
+    # Build song lookup
+    song_id_to_idx = {sid: idx for idx, sid in enumerate(playlist_song_ids)}
+
     if playlist_vec is not None and disc_params is not None:
         probs = predict_accept_probs(disc_params, playlist_vec, track_embs)
-        neutral_idx = [i for i, s in enumerate(songs) if not s.accepted and not s.rejected]
-        if neutral_idx:
-            neutral_probs = [(i, probs[i]) for i in neutral_idx]
-            neutral_probs.sort(key=lambda x: float(x[1]), reverse=True)
-        else:
-            neutral_probs = []
+        neutral_items = []
+        for song, ps in playlist_songs:
+            if not ps.accepted and not ps.rejected and song.id in song_id_to_idx:
+                idx = song_id_to_idx[song.id]
+                neutral_items.append((song, ps, float(probs[idx])))
+        neutral_items.sort(key=lambda x: x[2], reverse=True)
         st.info("Showing probability-ranked suggestions from discriminator")
     else:
-        neutral_probs = [(i, 0.5) for i, s in enumerate(songs) if not s.accepted and not s.rejected]
+        neutral_items = [(song, ps, 0.5) for song, ps in playlist_songs
+                        if not ps.accepted and not ps.rejected]
         st.info("Discriminator not trained yet. Showing all neutral songs.")
 
     max_to_show = st.number_input("Max suggestions to show", min_value=1, max_value=50, value=10)
 
-    for i, p in neutral_probs[:max_to_show]:
-        s = songs[i]
-        st.markdown(f"**Song {s.id}** — {s.youtube_url} (p≈{float(p):.2f})")
+    for song, ps, prob in neutral_items[:max_to_show]:
+        st.markdown(f"**Song {song.id}** — {song.youtube_url} (p≈{prob:.2f})")
 
         # Audio preview
-        if s.audio_path and os.path.exists(s.audio_path):
+        if song.audio_path and os.path.exists(song.audio_path):
             try:
-                with open(s.audio_path, "rb") as f:
+                with open(song.audio_path, "rb") as f:
                     audio_bytes = f.read()
                 st.audio(audio_bytes, format="audio/m4a")
             except Exception:
@@ -865,62 +984,93 @@ def render_sculpt_playlist_page():
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            if st.button("✅ Accept", key=f"accept_{i}"):
-                s.accepted = True
-                s.rejected = False
-                save_songs_meta(songs)
+            if st.button("✅ Accept", key=f"accept_{song.id}"):
+                db.update_song_status_in_playlist(current_playlist_id, song.id, accepted=True, rejected=False)
+                db.clear_playlist_songs_cache()
                 st.rerun()
         with c2:
-            if st.button("❌ Reject", key=f"reject_{i}"):
-                s.accepted = False
-                s.rejected = True
-                save_songs_meta(songs)
+            if st.button("❌ Reject", key=f"reject_{song.id}"):
+                db.update_song_status_in_playlist(current_playlist_id, song.id, accepted=False, rejected=True)
+                db.clear_playlist_songs_cache()
                 st.rerun()
         with c3:
-            st.write("")
+            if st.button("🗑️ Remove", key=f"remove_{song.id}"):
+                db.remove_song_from_playlist(current_playlist_id, song.id)
+                db.clear_playlist_songs_cache()
+                st.rerun()
 
     st.divider()
 
     # Reconsider rejected
     st.subheader("🔄 Reconsider Rejected Songs")
 
-    rejected_songs = [s for s in songs if s.rejected]
+    rejected_songs = [(song, ps) for song, ps in playlist_songs if ps.rejected]
     if rejected_songs:
-        for s in rejected_songs:
+        for song, ps in rejected_songs:
             c1, c2 = st.columns([3, 1])
             with c1:
-                st.write(f"{s.id}: {s.youtube_url[:50]}...")
+                st.write(f"{song.id}: {song.youtube_url[:50]}...")
             with c2:
-                if st.button("Make Neutral", key=f"neutral_{s.id}"):
-                    s.rejected = False
-                    save_songs_meta(songs)
+                if st.button("Make Neutral", key=f"neutral_{song.id}"):
+                    db.update_song_status_in_playlist(current_playlist_id, song.id, accepted=False, rejected=False)
+                    db.clear_playlist_songs_cache()
                     st.rerun()
     else:
         st.info("No rejected songs to reconsider.")
+
+    st.divider()
+
+    # Show accepted songs
+    st.subheader("✅ Accepted Songs")
+    accepted_songs = [(song, ps) for song, ps in playlist_songs if ps.accepted]
+    if accepted_songs:
+        for song, ps in accepted_songs:
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.write(f"{song.id}: {song.youtube_url[:50]}...")
+            with c2:
+                if st.button("Remove from accepted", key=f"unaccept_{song.id}"):
+                    db.update_song_status_in_playlist(current_playlist_id, song.id, accepted=False, rejected=False)
+                    db.clear_playlist_songs_cache()
+                    st.rerun()
+    else:
+        st.info("No accepted songs yet.")
 
 
 def render_visualizations_page():
     """Render visualizations page with similarity matrix and latent space."""
     st.header("📊 Visualizations")
 
-    songs: List[SongMeta] = st.session_state.get("songs", [])
-
-    if not songs:
-        st.warning("No songs loaded.")
+    current_playlist_id = st.session_state.get("current_playlist_id")
+    if not current_playlist_id:
+        st.warning("Select a playlist first from the sidebar.")
         return
 
-    if not FEATURES_PATH.exists():
-        st.warning("No features extracted.")
+    playlist = db.get_playlist(current_playlist_id)
+    if not playlist:
+        st.error("Selected playlist not found.")
         return
 
-    ae_params = load_feature_ae(AE_MODEL_PATH)
+    st.write(f"Visualizing: **{playlist.name}**")
+
+    # Get playlist data
+    playlist_features, playlist_song_ids, accepted_flags, rejected_flags = db.get_playlist_feature_matrix(current_playlist_id)
+
+    if len(playlist_features) == 0:
+        st.warning("No songs with features in this playlist.")
+        return
+
+    ae_params = load_feature_ae_from_db()
     if ae_params is None:
         st.warning("Train the Feature AE first.")
         return
 
-    features = np.load(FEATURES_PATH)
-    track_embs = compute_track_embeddings(ae_params, features)
+    track_embs = compute_track_embeddings(ae_params, playlist_features)
     n_songs = len(track_embs)
+
+    # Get playlist songs for status info
+    playlist_songs = db.get_songs_in_playlist(current_playlist_id)
+    song_id_to_status = {song.id: ps for song, ps in playlist_songs}
 
     # Similarity Matrix
     st.subheader("Song Similarity Matrix")
@@ -934,8 +1084,8 @@ def render_visualizations_page():
     im = ax.imshow(similarity_matrix, cmap="viridis", vmin=-1, vmax=1)
     ax.set_xticks(range(n_songs))
     ax.set_yticks(range(n_songs))
-    ax.set_xticklabels([f"{i}" for i in range(n_songs)], fontsize=8)
-    ax.set_yticklabels([f"{i}" for i in range(n_songs)], fontsize=8)
+    ax.set_xticklabels([f"{sid}" for sid in playlist_song_ids], fontsize=8)
+    ax.set_yticklabels([f"{sid}" for sid in playlist_song_ids], fontsize=8)
     plt.colorbar(im, ax=ax, label="Cosine Similarity")
     ax.set_title("Song Similarity (Cosine Distance in Latent Space)")
     st.pyplot(fig)
@@ -947,7 +1097,7 @@ def render_visualizations_page():
     st.subheader("🎶 Suggested Playlist Order")
     st.markdown("Songs ordered by similarity for smooth transitions:")
 
-    accepted_mask = np.array([s.accepted for s in songs], dtype=bool)
+    accepted_mask = np.array(accepted_flags, dtype=bool)
     accepted_indices = np.where(accepted_mask)[0]
 
     if len(accepted_indices) > 1:
@@ -955,11 +1105,16 @@ def render_visualizations_page():
         order_in_accepted = generate_playlist_order(accepted_sim_matrix)
         playlist_order = [accepted_indices[i] for i in order_in_accepted]
 
-        for rank, song_idx in enumerate(playlist_order):
-            s = songs[song_idx]
-            st.write(f"{rank + 1}. **Song {song_idx}** - {s.youtube_url[:60]}...")
+        for rank, idx in enumerate(playlist_order):
+            song_id = playlist_song_ids[idx]
+            song = db.get_song(song_id)
+            if song:
+                st.write(f"{rank + 1}. **Song {song_id}** - {song.youtube_url[:60]}...")
     elif len(accepted_indices) == 1:
-        st.write(f"1. **Song {accepted_indices[0]}** - {songs[accepted_indices[0]].youtube_url[:60]}...")
+        song_id = playlist_song_ids[accepted_indices[0]]
+        song = db.get_song(song_id)
+        if song:
+            st.write(f"1. **Song {song_id}** - {song.youtube_url[:60]}...")
     else:
         st.info("Accept some songs to see the optimized playlist order.")
 
@@ -973,17 +1128,18 @@ def render_visualizations_page():
 
         # Color by status
         colors = []
-        for s in songs:
-            if s.accepted:
+        for sid in playlist_song_ids:
+            ps = song_id_to_status.get(sid)
+            if ps and ps.accepted:
                 colors.append("green")
-            elif s.rejected:
+            elif ps and ps.rejected:
                 colors.append("red")
             else:
                 colors.append("gray")
 
         ax2.scatter(track_embs[:, 0], track_embs[:, 1], s=100, c=colors, alpha=0.7)
-        for i in range(n_songs):
-            ax2.annotate(f"{i}", (track_embs[i, 0], track_embs[i, 1]))
+        for i, sid in enumerate(playlist_song_ids):
+            ax2.annotate(f"{sid}", (track_embs[i, 0], track_embs[i, 1]))
 
         ax2.set_xlabel("Latent Dimension 1")
         ax2.set_ylabel("Latent Dimension 2")
@@ -1010,18 +1166,28 @@ def render_about_page():
 
         ## How It Works
 
-        1. **Load Songs**: Enter YouTube URLs individually or load from a text file
-        2. **Extract Features**: Download audio and compute rich audio features using librosa:
+        1. **Manage Playlists**: Create and manage multiple playlists
+        2. **Song Library**: Add YouTube URLs individually or load from a text file
+        3. **Extract Features**: Download audio and compute rich audio features using librosa:
            - Rhythm: tempo, beat regularity, onset strength
            - Loudness: RMS, loudness in dB
            - Spectral: centroid, bandwidth, rolloff, zero crossing rate
            - Tonal: 12-dimensional chroma features
            - Timbre: 13 MFCCs (mean and variance)
            - Harmonic/percussive ratio
-        3. **Train Feature AE**: Learn 11D song embeddings
-        4. **Sculpt Playlist**: Accept/reject songs to train the discriminator
-        5. **Get Recommendations**: Probability-ranked suggestions based on your preferences
+        4. **Train Models**:
+           - Feature AE (shared): Learn 11D song embeddings from ALL songs
+           - Discriminator (per playlist): Personalized recommendations
+        5. **Sculpt Playlist**: Accept/reject songs to refine recommendations
         6. **Visualize**: Similarity matrix and latent space plots
+
+        ## Key Features
+
+        - **Multi-playlist support**: Same song can appear in multiple playlists
+        - **SQLite database**: Persistent storage with automatic updates
+        - **Shared embedding model**: One autoencoder trained on all songs
+        - **Per-playlist discriminators**: Each playlist has its own trained recommender
+        - **Streamlit caching**: Efficient database access with manual refresh
 
         ## Technology Stack
 
@@ -1029,6 +1195,7 @@ def render_about_page():
         - **yt-dlp**: YouTube audio download
         - **librosa**: Audio feature extraction
         - **JAX**: Neural network training (pure SGD, no optax)
+        - **SQLite**: Persistent database storage
 
         ## Author
 

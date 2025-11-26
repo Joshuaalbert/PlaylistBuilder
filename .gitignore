@@ -6,6 +6,7 @@ __pycache__/
 # Audio and model files
 data/audio/
 data/models/
+data/playlist_sculptor.db
 *.wav
 *.mp3
 *.npz
