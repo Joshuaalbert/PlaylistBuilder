@@ -24,13 +24,12 @@ from typing import List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import librosa
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 import yt_dlp
-import librosa
 from jax import random
-
 
 # =========================
 # Paths & Constants
@@ -541,7 +540,7 @@ def main():
     st.markdown(
         """
         Sculpt your perfect playlist from YouTube URLs using machine learning!
-        
+
         This app uses:
         - **yt-dlp** to download audio from YouTube
         - **librosa** to extract audio features
@@ -638,19 +637,19 @@ def render_load_songs_page():
     if songs:
         # Three column view
         col1, col2, col3 = st.columns(3)
-        
+
         with col1:
             st.markdown("**✅ Accepted**")
             for s in songs:
                 if s.accepted:
                     st.write(f"{s.id}: {s.youtube_url[:40]}...")
-        
+
         with col2:
             st.markdown("**❌ Rejected**")
             for s in songs:
                 if s.rejected:
                     st.write(f"{s.id}: {s.youtube_url[:40]}...")
-        
+
         with col3:
             st.markdown("**⚪ Neutral**")
             for s in songs:
@@ -689,7 +688,7 @@ def render_extract_features_page():
                 progress_bar.progress((i + 1) / len(songs))
                 if not song.audio_path or not os.path.exists(song.audio_path):
                     songs[i] = download_audio_for_song(song)
-            
+
             feats = build_or_load_feature_matrix(songs)
             st.session_state["songs"] = songs
             st.success(f"Feature matrix shape: {feats.shape}")
@@ -823,7 +822,6 @@ def render_sculpt_playlist_page():
     track_embs = compute_track_embeddings(ae_params, features)
 
     accepted_mask = np.array([s.accepted for s in songs], dtype=bool)
-    rejected_mask = np.array([s.rejected for s in songs], dtype=bool)
     playlist_vec = compute_playlist_embedding(track_embs, accepted_mask)
 
     input_dim_disc = (LATENT_DIM + (LATENT_DIM * (LATENT_DIM + 1)) // 2) + LATENT_DIM
@@ -840,7 +838,7 @@ def render_sculpt_playlist_page():
             neutral_probs.sort(key=lambda x: float(x[1]), reverse=True)
         else:
             neutral_probs = []
-        st.info(f"Showing probability-ranked suggestions from discriminator")
+        st.info("Showing probability-ranked suggestions from discriminator")
     else:
         neutral_probs = [(i, 0.5) for i, s in enumerate(songs) if not s.accepted and not s.rejected]
         st.info("Discriminator not trained yet. Showing all neutral songs.")
@@ -1001,12 +999,12 @@ def render_about_page():
     st.markdown(
         """
         ## Overview
-        
+
         Playlist Sculptor is a Python application that helps you create cohesive playlists
         from YouTube videos using machine learning.
-        
+
         ## How It Works
-        
+
         1. **Load Songs**: Enter YouTube URLs individually or load from a text file
         2. **Extract Features**: Download audio and compute rich audio features using librosa:
            - Rhythm: tempo, beat regularity, onset strength
@@ -1019,16 +1017,16 @@ def render_about_page():
         4. **Sculpt Playlist**: Accept/reject songs to train the discriminator
         5. **Get Recommendations**: Probability-ranked suggestions based on your preferences
         6. **Visualize**: Similarity matrix and latent space plots
-        
+
         ## Technology Stack
-        
+
         - **Streamlit**: Web interface
         - **yt-dlp**: YouTube audio download
         - **librosa**: Audio feature extraction
         - **JAX**: Neural network training (pure SGD, no optax)
-        
+
         ## Author
-        
+
         Joshua Albert
         """
     )
