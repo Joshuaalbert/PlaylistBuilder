@@ -1154,7 +1154,7 @@ def render_visualizations_page():
                 statuses.append("Rejected")
             else:
                 statuses.append("Neutral")
-            urls.append(song.youtube_url if song else "Unknown")
+            urls.append(song.youtube_url if song else "URL not available")
             song_ids_list.append(f"Song {sid}")
 
         # Create plotly scatter plot with hover info
