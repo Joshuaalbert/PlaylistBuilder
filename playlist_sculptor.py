@@ -47,6 +47,7 @@ LATENT_DIM = 11
 HIDDEN_DIM = 64
 BATCH_SIZE = 32
 SAMPLE_RATE = 22050
+MIN_STD_THRESHOLD = 1e-6  # Minimum threshold for standard deviation normalization
 
 
 # =========================
@@ -231,9 +232,10 @@ def build_or_load_feature_matrix(songs: List[SongMeta]) -> np.ndarray:
             return feats
 
     all_feats = []
-    for song in songs:
+    for i, song in enumerate(songs):
         if not song.audio_path or not os.path.exists(song.audio_path):
-            song = download_audio_for_song(song)
+            songs[i] = download_audio_for_song(song)
+            song = songs[i]
         if not song.audio_path or not os.path.exists(song.audio_path):
             all_feats.append(np.zeros(51, dtype=np.float32))
             continue
@@ -254,7 +256,7 @@ def compute_feature_stats(features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]
     """Compute mean and std of features."""
     mean = features.mean(axis=0)
     std = features.std(axis=0)
-    std[std < 1e-6] = 1.0
+    std[std < MIN_STD_THRESHOLD] = 1.0
     return mean, std
 
 
