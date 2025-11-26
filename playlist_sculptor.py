@@ -161,6 +161,8 @@ def extract_features_from_audio(audio_path: str, sr: int = SAMPLE_RATE) -> np.nd
 
     # Rhythm / tempo
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+    # librosa >= 0.10.0 returns tempo as numpy array, convert to scalar
+    tempo = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
     if len(beats) > 1:
         beat_times = librosa.frames_to_time(beats, sr=sr)
         ibi = np.diff(beat_times)
