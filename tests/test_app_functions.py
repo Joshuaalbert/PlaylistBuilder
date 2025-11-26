@@ -255,3 +255,41 @@ class TestTrackEmbeddings:
 
         assert embeddings.shape == (10, APP_LATENT_DIM)
         assert isinstance(embeddings, np.ndarray)
+
+
+class TestFeatureExtraction:
+    """Tests for audio feature extraction."""
+
+    def test_extract_features_output_shape(self, tmp_path):
+        """Test feature extraction returns correct shape (51 dimensions)."""
+        import soundfile as sf
+
+        # Create a synthetic audio file (5 seconds of noise)
+        sr = 22050
+        duration = 5
+        audio = np.random.randn(sr * duration).astype(np.float32) * 0.1
+        audio_path = tmp_path / "test_audio.wav"
+        sf.write(audio_path, audio, sr)
+
+        features = ps.extract_features_from_audio(str(audio_path))
+
+        assert features.shape == (APP_FEATURE_DIM,)
+        assert features.dtype == np.float32
+
+    def test_extract_features_tempo_is_scalar(self, tmp_path):
+        """Test tempo is converted to scalar (librosa >= 0.10.0 returns array)."""
+        import soundfile as sf
+
+        # Create a synthetic audio file
+        sr = 22050
+        duration = 5
+        audio = np.random.randn(sr * duration).astype(np.float32) * 0.1
+        audio_path = tmp_path / "test_audio.wav"
+        sf.write(audio_path, audio, sr)
+
+        features = ps.extract_features_from_audio(str(audio_path))
+
+        # Tempo is at index 1 in the feature vector
+        tempo_value = features[1]
+        assert np.isscalar(tempo_value) or tempo_value.shape == ()
+        assert np.isfinite(tempo_value)
