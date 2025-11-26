@@ -9,9 +9,7 @@ This module provides functionality to:
 """
 
 import hashlib
-import os
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -20,8 +18,6 @@ import jax
 import jax.numpy as jnp
 import librosa
 import numpy as np
-import soundfile as sf
-
 
 # Constants
 LATENT_DIM = 11
