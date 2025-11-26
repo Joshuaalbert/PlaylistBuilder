@@ -12,18 +12,28 @@ from jax import random
 
 
 def load_ps_module():
-    """Load playlist_sculptor module without running main."""
+    """Load playlist_sculptor module without running main.
+
+    Note: We use exec() here because the playlist_sculptor.py file contains
+    Streamlit-specific code that would fail on regular import. This approach
+    allows us to load just the function definitions for testing.
+    """
     ps_path = Path(__file__).parent.parent / "playlist_sculptor.py"
     spec = importlib.util.spec_from_file_location("ps", ps_path)
     ps = importlib.util.module_from_spec(spec)
     sys.modules["ps"] = ps
     with open(ps_path, "r") as f:
         code = f.read()
-    exec(compile(code, ps_path, "exec"), ps.__dict__)
+    exec(compile(code, ps_path, "exec"), ps.__dict__)  # noqa: S102
     return ps
 
 
 ps = load_ps_module()
+
+# Feature dimension used in the Streamlit app (different from src module's 36)
+# This matches the extract_features_from_audio function output dimension
+APP_FEATURE_DIM = 51
+APP_LATENT_DIM = 11
 
 
 class TestFeatureStats:
@@ -31,11 +41,11 @@ class TestFeatureStats:
 
     def test_compute_feature_stats_shapes(self):
         """Test feature stats have correct shapes."""
-        features = np.random.randn(10, 51).astype(np.float32)
+        features = np.random.randn(10, APP_FEATURE_DIM).astype(np.float32)
         mean, std = ps.compute_feature_stats(features)
 
-        assert mean.shape == (51,)
-        assert std.shape == (51,)
+        assert mean.shape == (APP_FEATURE_DIM,)
+        assert std.shape == (APP_FEATURE_DIM,)
 
     def test_compute_feature_stats_min_std_threshold(self):
         """Test that std values below threshold are set to 1.0."""
@@ -57,44 +67,44 @@ class TestFeatureAutoencoder:
     def ae_params(self):
         """Create autoencoder params fixture."""
         rng = random.PRNGKey(42)
-        mean = np.zeros(51, dtype=np.float32)
-        std = np.ones(51, dtype=np.float32)
-        return ps.init_feature_ae(rng, 51, 11, mean, std)
+        mean = np.zeros(APP_FEATURE_DIM, dtype=np.float32)
+        std = np.ones(APP_FEATURE_DIM, dtype=np.float32)
+        return ps.init_feature_ae(rng, APP_FEATURE_DIM, APP_LATENT_DIM, mean, std)
 
     def test_init_feature_ae_shapes(self):
         """Test feature AE initialization produces correct shapes."""
         rng = random.PRNGKey(42)
-        mean = np.zeros(51, dtype=np.float32)
-        std = np.ones(51, dtype=np.float32)
-        params = ps.init_feature_ae(rng, 51, 11, mean, std)
+        mean = np.zeros(APP_FEATURE_DIM, dtype=np.float32)
+        std = np.ones(APP_FEATURE_DIM, dtype=np.float32)
+        params = ps.init_feature_ae(rng, APP_FEATURE_DIM, APP_LATENT_DIM, mean, std)
 
-        assert params.W_enc.shape == (11, 51)
-        assert params.b_enc.shape == (11,)
-        assert params.W_dec.shape == (51, 11)
-        assert params.b_dec.shape == (51,)
+        assert params.W_enc.shape == (APP_LATENT_DIM, APP_FEATURE_DIM)
+        assert params.b_enc.shape == (APP_LATENT_DIM,)
+        assert params.W_dec.shape == (APP_FEATURE_DIM, APP_LATENT_DIM)
+        assert params.b_dec.shape == (APP_FEATURE_DIM,)
 
     def test_ae_encode_output_shape(self, ae_params):
         """Test encoding produces correct shape."""
-        x = jnp.ones(51)
+        x = jnp.ones(APP_FEATURE_DIM)
         z = ps.ae_encode(ae_params, x)
-        assert z.shape == (11,)
+        assert z.shape == (APP_LATENT_DIM,)
 
     def test_ae_decode_output_shape(self, ae_params):
         """Test decoding produces correct shape."""
-        z = jnp.ones(11)
+        z = jnp.ones(APP_LATENT_DIM)
         x_hat = ps.ae_decode(ae_params, z)
-        assert x_hat.shape == (51,)
+        assert x_hat.shape == (APP_FEATURE_DIM,)
 
     def test_ae_roundtrip(self, ae_params):
         """Test encoder-decoder roundtrip produces same shape."""
-        x = jnp.ones(51)
+        x = jnp.ones(APP_FEATURE_DIM)
         z = ps.ae_encode(ae_params, x)
         x_hat = ps.ae_decode(ae_params, z)
         assert x_hat.shape == x.shape
 
     def test_ae_batch_loss_is_finite(self, ae_params):
         """Test batch loss is finite."""
-        batch_x = jnp.ones((5, 51))
+        batch_x = jnp.ones((5, APP_FEATURE_DIM))
         loss = ps.ae_batch_loss(ae_params, batch_x)
         assert jnp.isfinite(loss)
 
@@ -156,8 +166,8 @@ class TestSimilarity:
 
     def test_compute_similarity_range(self):
         """Test similarity is in [-1, 1] range."""
-        z1 = np.random.randn(11)
-        z2 = np.random.randn(11)
+        z1 = np.random.randn(APP_LATENT_DIM)
+        z2 = np.random.randn(APP_LATENT_DIM)
         sim = ps.compute_similarity(z1, z2)
         assert sim >= -1.0
         assert sim <= 1.0
@@ -199,32 +209,34 @@ class TestPlaylistEmbedding:
 
     def test_compute_playlist_embedding_none_when_empty(self):
         """Test empty mask returns None."""
-        track_embs = np.random.randn(10, 11).astype(np.float32)
+        track_embs = np.random.randn(10, APP_LATENT_DIM).astype(np.float32)
         mask = np.zeros(10, dtype=bool)
         result = ps.compute_playlist_embedding(track_embs, mask)
         assert result is None
 
     def test_compute_playlist_embedding_single_track(self):
         """Test single track embedding."""
-        track_embs = np.random.randn(10, 11).astype(np.float32)
+        track_embs = np.random.randn(10, APP_LATENT_DIM).astype(np.float32)
         mask = np.zeros(10, dtype=bool)
         mask[0] = True
 
         result = ps.compute_playlist_embedding(track_embs, mask)
 
         assert result is not None
-        # Expected size: 11 (mean) + 66 (upper triangular of 11x11 cov) = 77
-        assert result.shape == (77,)
+        # Expected size: latent_dim (mean) + upper triangular of cov matrix
+        expected_size = APP_LATENT_DIM + (APP_LATENT_DIM * (APP_LATENT_DIM + 1)) // 2
+        assert result.shape == (expected_size,)
 
     def test_compute_playlist_embedding_multiple_tracks(self):
         """Test multiple tracks embedding."""
-        track_embs = np.random.randn(10, 11).astype(np.float32)
+        track_embs = np.random.randn(10, APP_LATENT_DIM).astype(np.float32)
         mask = np.array([True, True, True, False, False, False, False, False, False, False])
 
         result = ps.compute_playlist_embedding(track_embs, mask)
 
         assert result is not None
-        assert result.shape == (77,)
+        expected_size = APP_LATENT_DIM + (APP_LATENT_DIM * (APP_LATENT_DIM + 1)) // 2
+        assert result.shape == (expected_size,)
         assert result.dtype == np.float32
 
 
@@ -234,12 +246,12 @@ class TestTrackEmbeddings:
     def test_compute_track_embeddings_shape(self):
         """Test track embeddings have correct shape."""
         rng = random.PRNGKey(42)
-        mean = np.zeros(51, dtype=np.float32)
-        std = np.ones(51, dtype=np.float32)
-        ae_params = ps.init_feature_ae(rng, 51, 11, mean, std)
+        mean = np.zeros(APP_FEATURE_DIM, dtype=np.float32)
+        std = np.ones(APP_FEATURE_DIM, dtype=np.float32)
+        ae_params = ps.init_feature_ae(rng, APP_FEATURE_DIM, APP_LATENT_DIM, mean, std)
 
-        features = np.random.randn(10, 51).astype(np.float32)
+        features = np.random.randn(10, APP_FEATURE_DIM).astype(np.float32)
         embeddings = ps.compute_track_embeddings(ae_params, features)
 
-        assert embeddings.shape == (10, 11)
+        assert embeddings.shape == (10, APP_LATENT_DIM)
         assert isinstance(embeddings, np.ndarray)
