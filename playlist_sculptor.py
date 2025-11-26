@@ -9,6 +9,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 
@@ -304,8 +305,6 @@ def render_sculpt_playlist_page():
             similarity_matrix[i, j] = compute_similarity(latent_codes[i], latent_codes[j])
 
     # Display as heatmap
-    import matplotlib.pyplot as plt
-
     fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(similarity_matrix, cmap="viridis", vmin=-1, vmax=1)
     ax.set_xticks(range(n_songs))

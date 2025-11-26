@@ -25,7 +25,7 @@ import soundfile as sf
 
 # Constants
 LATENT_DIM = 11
-FEATURE_DIM = 128  # Number of MFCCs and other features
+FEATURE_DIM = 36  # 20 MFCCs + 12 chroma + 1 spectral centroid + 1 rolloff + 1 zcr + 1 tempo
 SAMPLE_RATE = 22050
 DURATION = 30  # Seconds of audio to analyze
 
@@ -57,7 +57,7 @@ def get_data_dir() -> Path:
 
 def url_to_filename(url: str) -> str:
     """Convert URL to a safe filename using hash."""
-    return hashlib.md5(url.encode()).hexdigest()
+    return hashlib.sha256(url.encode()).hexdigest()[:32]
 
 
 def download_audio(url: str, output_dir: Optional[Path] = None) -> Path:
@@ -184,7 +184,7 @@ def init_encoder_params(key: jax.Array, input_dim: int, latent_dim: int = LATENT
     return params
 
 
-def init_decoder_params(key: jax.Array, latent_dim: int = LATENT_DIM, output_dim: int = 36) -> dict:
+def init_decoder_params(key: jax.Array, latent_dim: int = LATENT_DIM, output_dim: int = FEATURE_DIM) -> dict:
     """Initialize decoder parameters."""
     keys = jax.random.split(key, 3)
 
