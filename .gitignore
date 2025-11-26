@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Audio and model files
+data/audio/
+data/models/
+*.wav
+*.mp3
+*.npz
+
 # C extensions
 *.so
 
