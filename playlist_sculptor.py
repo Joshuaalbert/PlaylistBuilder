@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import librosa
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.express as px
 import streamlit as st
 import yt_dlp
 from jax import random
@@ -1120,37 +1121,77 @@ def render_visualizations_page():
 
     st.divider()
 
-    # Latent Space Visualization
-    st.subheader("📈 Latent Space Visualization")
+    # Interactive Embedding Visualization
+    st.subheader("📈 Interactive Embedding Visualization")
+    st.markdown(
+        "Explore the 11D song embeddings by selecting which dimensions to visualize. "
+        "Hover over points to see song details."
+    )
 
     if track_embs.shape[1] >= 2:
-        fig2, ax2 = plt.subplots(figsize=(10, 8))
+        latent_dim = track_embs.shape[1]
+        dim_options = [f"Dimension {i + 1}" for i in range(latent_dim)]
 
-        # Color by status
-        colors = []
+        col1, col2 = st.columns(2)
+        with col1:
+            x_dim = st.selectbox("X-axis dimension", dim_options, index=0, key="emb_x_dim")
+        with col2:
+            y_dim = st.selectbox("Y-axis dimension", dim_options, index=1, key="emb_y_dim")
+
+        x_idx = dim_options.index(x_dim)
+        y_idx = dim_options.index(y_dim)
+
+        # Prepare data for plotly
+        statuses = []
+        urls = []
+        song_ids_list = []
         for sid in playlist_song_ids:
             ps = song_id_to_status.get(sid)
+            song = db.get_song(sid)
             if ps and ps.accepted:
-                colors.append("green")
+                statuses.append("Accepted")
             elif ps and ps.rejected:
-                colors.append("red")
+                statuses.append("Rejected")
             else:
-                colors.append("gray")
+                statuses.append("Neutral")
+            urls.append(song.youtube_url if song else "URL not available")
+            song_ids_list.append(f"Song {sid}")
 
-        ax2.scatter(track_embs[:, 0], track_embs[:, 1], s=100, c=colors, alpha=0.7)
-        for i, sid in enumerate(playlist_song_ids):
-            ax2.annotate(f"{sid}", (track_embs[i, 0], track_embs[i, 1]))
+        # Create plotly scatter plot with hover info
+        fig_interactive = px.scatter(
+            x=track_embs[:, x_idx],
+            y=track_embs[:, y_idx],
+            color=statuses,
+            color_discrete_map={
+                "Accepted": "green",
+                "Rejected": "red",
+                "Neutral": "gray",
+            },
+            hover_name=song_ids_list,
+            hover_data={
+                "URL": urls,
+                "Status": statuses,
+            },
+            labels={
+                "x": x_dim,
+                "y": y_dim,
+                "color": "Status",
+            },
+            title=f"Song Embeddings: {x_dim} vs {y_dim}",
+        )
 
-        ax2.set_xlabel("Latent Dimension 1")
-        ax2.set_ylabel("Latent Dimension 2")
-        ax2.set_title("Songs in Latent Space (First 2 Dimensions)")
-        ax2.legend(handles=[
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, label='Accepted'),
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='Rejected'),
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=10, label='Neutral'),
-        ])
-        st.pyplot(fig2)
-        plt.close()
+        fig_interactive.update_traces(marker=dict(size=12, opacity=0.7))
+        fig_interactive.update_layout(
+            height=600,
+            legend=dict(
+                yanchor="top",
+                y=0.99,
+                xanchor="left",
+                x=0.01,
+            ),
+        )
+
+        st.plotly_chart(fig_interactive, use_container_width=True)
 
 
 def render_about_page():
